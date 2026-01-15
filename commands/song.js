@@ -1,191 +1,243 @@
-/*Créditos A Quien Correspondan 
-Play Traido y Editado 
-Por Cuervo-Team-Supreme*/
 const axios = require('axios');
 const yts = require('yt-search');
-const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
+const { toAudio } = require('../lib/converter');
+
+const AXIOS_DEFAULTS = {
+	timeout: 60000,
+	headers: {
+		'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+		'Accept': 'application/json, text/plain, */*'
+	}
+};
+
+async function tryRequest(getter, attempts = 3) {
+	let lastError;
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		try {
+			return await getter();
+		} catch (err) {
+			lastError = err;
+			if (attempt < attempts) {
+				await new Promise(r => setTimeout(r, 1000 * attempt));
+			}
+		}
+	}
+	throw lastError;
+}
+
+async function getYupraDownloadByUrl(youtubeUrl) {
+	const apiUrl = `https://api.yupra.my.id/api/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`;
+	const res = await tryRequest(() => axios.get(apiUrl, AXIOS_DEFAULTS));
+	if (res?.data?.success && res?.data?.data?.download_url) {
+		return {
+			download: res.data.data.download_url,
+			title: res.data.data.title,
+			thumbnail: res.data.data.thumbnail
+		};
+	}
+	throw new Error('Yupra returned no download');
+}
+
+async function getOkatsuDownloadByUrl(youtubeUrl) {
+	const apiUrl = `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`;
+	const res = await tryRequest(() => axios.get(apiUrl, AXIOS_DEFAULTS));
+	// Okatsu response shape: { status, creator, title, format, thumb, duration, cached, dl }
+	if (res?.data?.dl) {
+		return {
+			download: res.data.dl,
+			title: res.data.title,
+			thumbnail: res.data.thumb
+		};
+	}
+	throw new Error('Okatsu ytmp3 returned no download');
+}
 
 async function songCommand(sock, chatId, message) {
     try {
-        const text = message.message?.conversation || message.message?.extendedTextMessage?.text;
-        const searchQuery = text.split(' ').slice(1).join(' ').trim();
-        
-        if (!searchQuery) {
-            return await sock.sendMessage(chatId, { 
-                text: "What song do you want to download?"
-            });
+        const text = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
+        if (!text) {
+            await sock.sendMessage(chatId, { text: 'Usage: .song <song name or YouTube link>' }, { quoted: message });
+            return;
         }
 
-        // Search for the song
-        const { videos } = await yts(searchQuery);
-        if (!videos || videos.length === 0) {
-            return await sock.sendMessage(chatId, { 
-                text: "No songs found!"
-            });
-        }
-
-        const video = videos[0];
-        const videoUrl = video.url;
-
-        // Send loading message
-        await sock.sendMessage(chatId, {
-            text: `*${video.title}*\n\n*Duration:* ${formatDuration(video.duration.seconds)}\n*Views:* ${formatNumber(video.views)}\n\n_Downloading your song..._`
-        }, { quoted: message });
-
-        // Create temp directory if it doesn't exist
-        const tempDir = path.join(__dirname, '../temp');
-        if (!fs.existsSync(tempDir)) {
-            fs.mkdirSync(tempDir);
-        }
-
-        const tempFile = path.join(tempDir, `${Date.now()}.mp3`);
-        const tempM4a = path.join(tempDir, `${Date.now()}.m4a`);
-
-        try {
-            // Try siputzx API first
-            const siputzxRes = await fetch(`https://api.siputzx.my.id/api/d/ytmp3?url=${encodeURIComponent(videoUrl)}`);
-            const siputzxData = await siputzxRes.json();
-            
-            if (siputzxData && siputzxData.data && siputzxData.data.dl) {
-                // Download the file first
-                const response = await fetch(siputzxData.data.dl);
-                const buffer = await response.buffer();
-                
-                // Write to temp file
-                fs.writeFileSync(tempM4a, buffer);
-                
-                // Convert to MP3 with proper WhatsApp-compatible settings
-                await execPromise(`ffmpeg -i "${tempM4a}" -vn -acodec libmp3lame -ac 2 -ab 128k -ar 44100 "${tempFile}"`);
-                
-                // Check file size
-                const stats = fs.statSync(tempFile);
-                if (stats.size < 1024) {
-                    throw new Error('Conversion failed');
-                }
-
-                await sock.sendMessage(chatId, {
-                    audio: { url: tempFile },
-                    mimetype: "audio/mpeg",
-                    fileName: `${video.title}.mp3`,
-                    ptt: false
-                }, { quoted: message });
-
-                // Clean up temp files
-                setTimeout(() => {
-                    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-                    if (fs.existsSync(tempM4a)) fs.unlinkSync(tempM4a);
-                }, 5000);
+        let video;
+        if (text.includes('youtube.com') || text.includes('youtu.be')) {
+			video = { url: text };
+        } else {
+			const search = await yts(text);
+			if (!search || !search.videos.length) {
+                await sock.sendMessage(chatId, { text: 'No results found.' }, { quoted: message });
                 return;
             }
-        } catch (e1) {
-            console.error('Error with siputzx API:', e1);
-            try {
-                // Try zenkey API as fallback
-                const zenkeyRes = await fetch(`https://api.zenkey.my.id/api/download/ytmp3?apikey=zenkey&url=${encodeURIComponent(videoUrl)}`);
-                const zenkeyData = await zenkeyRes.json();
-                
-                if (zenkeyData && zenkeyData.result && zenkeyData.result.downloadUrl) {
-                    // Download the file first
-                    const response = await fetch(zenkeyData.result.downloadUrl);
-                    const buffer = await response.buffer();
-                    
-                    // Write to temp file
-                    fs.writeFileSync(tempM4a, buffer);
-                    
-                    // Convert to MP3 with proper WhatsApp-compatible settings
-                    await execPromise(`ffmpeg -i "${tempM4a}" -vn -acodec libmp3lame -ac 2 -ab 128k -ar 44100 "${tempFile}"`);
-                    
-                    // Check file size
-                    const stats = fs.statSync(tempFile);
-                    if (stats.size < 1024) {
-                        throw new Error('Conversion failed');
-                    }
-
-                    await sock.sendMessage(chatId, {
-                        audio: { url: tempFile },
-                        mimetype: "audio/mpeg",
-                        fileName: `${video.title}.mp3`,
-                        ptt: false
-                    }, { quoted: message });
-
-                    // Clean up temp files
-                    setTimeout(() => {
-                        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-                        if (fs.existsSync(tempM4a)) fs.unlinkSync(tempM4a);
-                    }, 5000);
-                    return;
-                }
-            } catch (e2) {
-                console.error('Error with zenkey API:', e2);
-                try {
-                    // Try axeel API as last resort
-                    const axeelRes = await fetch(`https://api.axeel.my.id/api/download/ytmp3?apikey=axeel&url=${encodeURIComponent(videoUrl)}`);
-                    const axeelData = await axeelRes.json();
-                    
-                    if (axeelData && axeelData.result && axeelData.result.downloadUrl) {
-                        // Download the file first
-                        const response = await fetch(axeelData.result.downloadUrl);
-                        const buffer = await response.buffer();
-                        
-                        // Write to temp file
-                        fs.writeFileSync(tempM4a, buffer);
-                        
-                        // Convert to MP3 with proper WhatsApp-compatible settings
-                        await execPromise(`ffmpeg -i "${tempM4a}" -vn -acodec libmp3lame -ac 2 -ab 128k -ar 44100 "${tempFile}"`);
-                        
-                        // Check file size
-                        const stats = fs.statSync(tempFile);
-                        if (stats.size < 1024) {
-                            throw new Error('Conversion failed');
-                        }
-
-                        await sock.sendMessage(chatId, {
-                            audio: { url: tempFile },
-                            mimetype: "audio/mpeg",
-                            fileName: `${video.title}.mp3`,
-                            ptt: false
-                        }, { quoted: message });
-
-                        // Clean up temp files
-                        setTimeout(() => {
-                            if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-                            if (fs.existsSync(tempM4a)) fs.unlinkSync(tempM4a);
-                        }, 5000);
-                        return;
-                    }
-                } catch (e3) {
-                    console.error('Error with axeel API:', e3);
-                    throw new Error("All download methods failed");
-                }
-            }
+			video = search.videos[0];
         }
-    } catch (error) {
-        console.error('Error in song command:', error);
-        await sock.sendMessage(chatId, { 
-            text: "Failed to download the song. Please try again later or try a different song."
-        });
+
+        // Inform user
+        await sock.sendMessage(chatId, {
+            image: { url: video.thumbnail },
+            caption: `🎵 Downloading: *${video.title}*\n⏱ Duration: ${video.timestamp}`
+        }, { quoted: message });
+
+		// Try Yupra primary, then Okatsu fallback
+		let audioData;
+		try {
+			// 1) Primary: Yupra by youtube url
+			audioData = await getYupraDownloadByUrl(video.url);
+		} catch (e1) {
+			// 2) Fallback: Okatsu by youtube url
+			audioData = await getOkatsuDownloadByUrl(video.url);
+		}
+
+		const audioUrl = audioData.download || audioData.dl || audioData.url;
+
+		// Download audio to buffer - try arraybuffer first, fallback to stream
+		let audioBuffer;
+		try {
+			const audioResponse = await axios.get(audioUrl, {
+				responseType: 'arraybuffer',
+				timeout: 90000,
+				maxContentLength: Infinity,
+				maxBodyLength: Infinity,
+				decompress: true,
+				validateStatus: s => s >= 200 && s < 400,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+					'Accept': '*/*',
+					'Accept-Encoding': 'identity' // Disable compression to avoid corruption
+				}
+			});
+			audioBuffer = Buffer.from(audioResponse.data);
+		} catch (e1) {
+			// Fallback: use stream mode
+			const audioResponse = await axios.get(audioUrl, {
+				responseType: 'stream',
+				timeout: 90000,
+				maxContentLength: Infinity,
+				maxBodyLength: Infinity,
+				validateStatus: s => s >= 200 && s < 400,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+					'Accept': '*/*',
+					'Accept-Encoding': 'identity'
+				}
+			});
+			const chunks = [];
+			await new Promise((resolve, reject) => {
+				audioResponse.data.on('data', c => chunks.push(c));
+				audioResponse.data.on('end', resolve);
+				audioResponse.data.on('error', reject);
+			});
+			audioBuffer = Buffer.concat(chunks);
+		}
+
+		// Validate buffer
+		if (!audioBuffer || audioBuffer.length === 0) {
+			throw new Error('Downloaded audio buffer is empty');
+		}
+
+		// Detect actual file format from signature
+		const firstBytes = audioBuffer.slice(0, 12);
+		const hexSignature = firstBytes.toString('hex');
+		const asciiSignature = firstBytes.toString('ascii', 4, 8);
+
+		let actualMimetype = 'audio/mpeg';
+		let fileExtension = 'mp3';
+		let detectedFormat = 'unknown';
+
+		// Check for MP4/M4A (ftyp box)
+		if (asciiSignature === 'ftyp' || hexSignature.startsWith('000000')) {
+			// Check if it's M4A (audio/mp4)
+			const ftypBox = audioBuffer.slice(4, 8).toString('ascii');
+			if (ftypBox === 'ftyp') {
+				detectedFormat = 'M4A/MP4';
+				actualMimetype = 'audio/mp4';
+				fileExtension = 'm4a';
+			}
+		}
+		// Check for MP3 (ID3 tag or MPEG frame sync)
+		else if (audioBuffer.toString('ascii', 0, 3) === 'ID3' || 
+		         (audioBuffer[0] === 0xFF && (audioBuffer[1] & 0xE0) === 0xE0)) {
+			detectedFormat = 'MP3';
+			actualMimetype = 'audio/mpeg';
+			fileExtension = 'mp3';
+		}
+		// Check for OGG/Opus
+		else if (audioBuffer.toString('ascii', 0, 4) === 'OggS') {
+			detectedFormat = 'OGG/Opus';
+			actualMimetype = 'audio/ogg; codecs=opus';
+			fileExtension = 'ogg';
+		}
+		// Check for WAV
+		else if (audioBuffer.toString('ascii', 0, 4) === 'RIFF') {
+			detectedFormat = 'WAV';
+			actualMimetype = 'audio/wav';
+			fileExtension = 'wav';
+		}
+		else {
+			// Default to M4A since that's what the signature often suggests
+			actualMimetype = 'audio/mp4';
+			fileExtension = 'm4a';
+			detectedFormat = 'Unknown (defaulting to M4A)';
+		}
+
+		// Convert to MP3 if not already MP3
+		let finalBuffer = audioBuffer;
+		let finalMimetype = 'audio/mpeg';
+		let finalExtension = 'mp3';
+
+		if (fileExtension !== 'mp3') {
+			try {
+				finalBuffer = await toAudio(audioBuffer, fileExtension);
+				if (!finalBuffer || finalBuffer.length === 0) {
+					throw new Error('Conversion returned empty buffer');
+				}
+				finalMimetype = 'audio/mpeg';
+				finalExtension = 'mp3';
+			} catch (convErr) {
+				throw new Error(`Failed to convert ${detectedFormat} to MP3: ${convErr.message}`);
+			}
+		}
+
+		// Send buffer as MP3
+		await sock.sendMessage(chatId, {
+			audio: finalBuffer,
+			mimetype: finalMimetype,
+			fileName: `${(audioData.title || video.title || 'song')}.${finalExtension}`,
+			ptt: false
+		}, { quoted: message });
+
+		// Cleanup: Delete temp files created during conversion
+		try {
+			const tempDir = path.join(__dirname, '../temp');
+			if (fs.existsSync(tempDir)) {
+				const files = fs.readdirSync(tempDir);
+				const now = Date.now();
+				files.forEach(file => {
+					const filePath = path.join(tempDir, file);
+					try {
+						const stats = fs.statSync(filePath);
+						// Delete temp files older than 10 seconds (conversion temp files)
+						if (now - stats.mtimeMs > 10000) {
+							// Check if it's a temp audio file (mp3, m4a, or numeric timestamp files from converter)
+							if (file.endsWith('.mp3') || file.endsWith('.m4a') || /^\d+\.(mp3|m4a)$/.test(file)) {
+								fs.unlinkSync(filePath);
+							}
+						}
+					} catch (e) {
+						// Ignore individual file errors
+					}
+				});
+			}
+		} catch (cleanupErr) {
+			// Ignore cleanup errors
+		}
+
+    } catch (err) {
+        console.error('Song command error:', err);
+        await sock.sendMessage(chatId, { text: '❌ Failed to download song.' }, { quoted: message });
     }
 }
 
-function formatDuration(seconds) {
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const remainingSeconds = seconds % 60;
-    
-    if (hours > 0) {
-        return `${hours}:${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
-    } else {
-        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
-    }
-}
-
-function formatNumber(num) {
-    return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
-module.exports = songCommand; 
+module.exports = songCommand;
